@@ -26,8 +26,11 @@ project=
 # The name of the BigQuery dataset to write to (leave the '.*=' at the beginning, enter your
 # dataset after it)
 datasets=.*=
-# The location of a BigQuery service account JSON key file
+# The location of a BigQuery service account or user JSON credentials file
+# or service account credentials or user credentials in JSON format (non-escaped JSON blob)
 keyfile=
+# 'FILE' if keyfile is a credentials file, 'JSON' if it's a credentials JSON
+keySource=FILE
 ```
 
 You'll need to choose a BigQuery project to write to, a dataset from that project to write to, and
@@ -55,7 +58,7 @@ $ ./gradlew clean distTar
 And then extract its contents:
 
 ```bash
-$ mkdir bin/jar/ && tar -C bin/jar/ -xf kcbq-confluent/build/distributions/kcbq-confluent-*.tar
+$ mkdir -p bin/jar/ && tar -C bin/jar/ -xf kcbq-confluent/build/distributions/kcbq-confluent-*.tar
 ```
 
 ### Setting-Up Background Processes
