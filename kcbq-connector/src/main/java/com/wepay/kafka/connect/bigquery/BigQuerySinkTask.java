@@ -81,6 +81,7 @@ public class BigQuerySinkTask extends SinkTask {
   private RecordConverter<Map<String, Object>> recordConverter;
   private Map<String, TableId> topicsToBaseTableIds;
   private boolean useMessageTimeDatePartitioning;
+  private boolean usePartitionDecorator;
 
   private TopicPartitionManager topicPartitionManager;
 
@@ -141,35 +142,21 @@ public class BigQuerySinkTask extends SinkTask {
 
     TableId baseTableId = topicsToBaseTableIds.get(record.topic());
 
-    maybeCreateTable(record, baseTableId);
-
     PartitionedTableId.Builder builder = new PartitionedTableId.Builder(baseTableId);
-    if (useMessageTimeDatePartitioning) {
-      if (record.timestampType() == TimestampType.NO_TIMESTAMP_TYPE) {
-        throw new ConnectException(
-            "Message has no timestamp type, cannot use message timestamp to partition.");
-      }
-
-      builder.setDayPartition(record.timestamp());
-    } else {
-      builder.setDayPartitionForNow();
+    if(usePartitionDecorator) {
+    	
+	  if (useMessageTimeDatePartitioning) {
+	    if (record.timestampType() == TimestampType.NO_TIMESTAMP_TYPE) {
+		  throw new ConnectException(
+	      "Message has no timestamp type, cannot use message timestamp to partition.");
+	    }
+	    builder.setDayPartition(record.timestamp());
+	  } else {
+	    builder.setDayPartitionForNow();
+	  }
     }
 
     return builder.build();
-  }
-
-  /**
-   * Create the table which doesn't exist in BigQuery for a (record's) topic when autoCreateTables config is set to true.
-   * @param record Kafka Sink Record to be streamed into BigQuery.
-   * @param baseTableId BaseTableId in BigQuery.
-   */
-  private void maybeCreateTable(SinkRecord record, TableId baseTableId) {
-    BigQuery bigQuery = getBigQuery();
-    boolean autoCreateTables = config.getBoolean(config.TABLE_CREATE_CONFIG);
-    if (autoCreateTables && bigQuery.getTable(baseTableId) == null) {
-      getSchemaManager(bigQuery).createTable(baseTableId, record.topic());
-      logger.info("Table {} does not exist, auto-created table for topic {}", baseTableId, record.topic());
-    }
   }
 
   private RowToInsert getRecordRow(SinkRecord record) {
@@ -214,7 +201,8 @@ public class BigQuerySinkTask extends SinkTask {
         if (!tableWriterBuilders.containsKey(table)) {
           TableWriterBuilder tableWriterBuilder;
           if (config.getList(config.ENABLE_BATCH_CONFIG).contains(record.topic())) {
-            String gcsBlobName = record.topic() + "_" + uuid + "_" + Instant.now().toEpochMilli();
+            String topic = record.topic();
+            String gcsBlobName = topic + "_" + uuid + "_" + Instant.now().toEpochMilli();
             String gcsFolderName = config.getString(config.GCS_FOLDER_NAME_CONFIG);
             if (gcsFolderName != null && !"".equals(gcsFolderName)) {
               gcsBlobName = gcsFolderName + "/" + gcsBlobName;
@@ -224,6 +212,7 @@ public class BigQuerySinkTask extends SinkTask {
                 table.getBaseTableId(),
                 config.getString(config.GCS_BUCKET_NAME_CONFIG),
                 gcsBlobName,
+                topic,
                 recordConverter);
           } else {
             tableWriterBuilder =
@@ -262,7 +251,7 @@ public class BigQuerySinkTask extends SinkTask {
       return testBigQuery;
     }
     String projectName = config.getString(config.PROJECT_CONFIG);
-    String keyFile = config.getString(config.KEYFILE_CONFIG);
+    String keyFile = config.getKeyFile();
     String keySource = config.getString(config.KEY_SOURCE_CONFIG);
     return new BigQueryHelper().setKeySource(keySource).connect(projectName, keyFile);
   }
@@ -276,19 +265,24 @@ public class BigQuerySinkTask extends SinkTask {
         config.getSchemaConverter();
     Optional<String> kafkaKeyFieldName = config.getKafkaKeyFieldName();
     Optional<String> kafkaDataFieldName = config.getKafkaDataFieldName();
-    return new SchemaManager(schemaRetriever, schemaConverter, bigQuery, kafkaKeyFieldName, kafkaDataFieldName);
+    Optional<String> timestampPartitionFieldName = config.getTimestampPartitionFieldName();
+    return new SchemaManager(schemaRetriever, schemaConverter, bigQuery, kafkaKeyFieldName,
+                             kafkaDataFieldName, timestampPartitionFieldName);
   }
 
   private BigQueryWriter getBigQueryWriter() {
-    boolean updateSchemas = config.getBoolean(config.SCHEMA_UPDATE_CONFIG);
+    boolean autoUpdateSchemas = config.getBoolean(config.SCHEMA_UPDATE_CONFIG);
+    boolean autoCreateTables = config.getBoolean(config.TABLE_CREATE_CONFIG);
     int retry = config.getInt(config.BIGQUERY_RETRY_CONFIG);
     long retryWait = config.getLong(config.BIGQUERY_RETRY_WAIT_CONFIG);
     BigQuery bigQuery = getBigQuery();
-    if (updateSchemas) {
+    if (autoUpdateSchemas || autoCreateTables) {
       return new AdaptiveBigQueryWriter(bigQuery,
                                         getSchemaManager(bigQuery),
                                         retry,
-                                        retryWait);
+                                        retryWait,
+                                        autoUpdateSchemas,
+                                        autoCreateTables);
     } else {
       return new SimpleBigQueryWriter(bigQuery, retry, retryWait);
     }
@@ -299,7 +293,7 @@ public class BigQuerySinkTask extends SinkTask {
       return testGcs;
     }
     String projectName = config.getString(config.PROJECT_CONFIG);
-    String key = config.getString(config.KEYFILE_CONFIG);
+    String key = config.getKeyFile();
     String keySource = config.getString(config.KEY_SOURCE_CONFIG);
     return new GCSBuilder(projectName).setKey(key).setKeySource(keySource).build();
 
@@ -309,10 +303,16 @@ public class BigQuerySinkTask extends SinkTask {
     BigQuery bigQuery = getBigQuery();
     int retry = config.getInt(config.BIGQUERY_RETRY_CONFIG);
     long retryWait = config.getLong(config.BIGQUERY_RETRY_WAIT_CONFIG);
+    boolean autoCreateTables = config.getBoolean(config.TABLE_CREATE_CONFIG);
+    // schemaManager shall only be needed for creating table hence do not fetch instance if not
+    // needed.
+    SchemaManager schemaManager = autoCreateTables ? getSchemaManager(bigQuery) : null;
     return new GCSToBQWriter(getGcs(),
                          bigQuery,
+                         schemaManager,
                          retry,
-                         retryWait);
+                         retryWait,
+                         autoCreateTables);
   }
 
   @Override
@@ -337,6 +337,8 @@ public class BigQuerySinkTask extends SinkTask {
     topicPartitionManager = new TopicPartitionManager();
     useMessageTimeDatePartitioning =
         config.getBoolean(config.BIGQUERY_MESSAGE_TIME_PARTITIONING_CONFIG);
+    usePartitionDecorator = 
+            config.getBoolean(config.BIGQUERY_PARTITION_DECORATOR_CONFIG);
     if (hasGCSBQTask) {
       startGCSToBQLoadTask();
     }
